@@ -1,0 +1,324 @@
+import logging
+import os
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
+from sklearn.model_selection import StratifiedKFold
+from torch import nn
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
+from transformers import AdamW
+from transformers import BertModel
+from transformers import BertPreTrainedModel
+from transformers import BertTokenizer
+from transformers import TrainingArguments
+from transformers import get_linear_schedule_with_warmup
+from transformers import set_seed
+from transformers.trainer import Trainer
+from transformers.trainer_callback import DefaultFlowCallback
+from transformers.trainer_callback import TrainerCallback
+from transformers.trainer_callback import TrainerControl
+from transformers.trainer_callback import TrainerState
+from transformers.trainer_utils import IntervalStrategy
+
+logging.basicConfig(filename='log/global_pointer1025.txt', format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+                    datefmt='%Y/%m/%d %H:%M:%S', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class CustomModel(BertPreTrainedModel):
+    """自定义模型"""
+
+    def __init__(self, config):
+        super(CustomModel, self).__init__(config)
+        self.bert = BertModel(config)
+        self.classifier = nn.Linear(768, 2)  # 设置多分类的类别数，注意初始化方式
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        y = self.classifier(outputs.pooler_output)
+
+        return y
+
+
+class CustomDataset(Dataset):
+    def __init__(self, data_frame):
+        self._data = data_frame
+        self._sentence = self._data.sentence
+        self._label = self._data.label
+
+    def __len__(self):
+        return len(self._data)
+
+    def __getitem__(self, index):
+        return self._sentence.iloc[index], self._label.iloc[index]
+
+
+class CustomEarlyStoppingCallback(TrainerCallback):
+    """
+    自定义Callback
+    """
+
+    def __init__(self, early_stopping_patience=1, early_stopping_threshold=0.0):
+        self.early_stopping_patience = early_stopping_patience
+        self.early_stopping_threshold = early_stopping_threshold
+        # early_stopping_patience_counter denotes the number of times validation metrics failed to improve.
+        self.early_stopping_patience_counter = 0
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        state.training_step_metric_history = []  # 记录training_step的指标，比如准确率
+        assert (args.metric_for_best_model is not None), "Callback requires metric_for_best_model is defined"
+        assert (args.evaluation_strategy != IntervalStrategy.NO), "Callback requires IntervalStrategy of steps or epoch"
+
+    def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        # Log
+        if state.global_step == 1 and args.logging_first_step:
+            control.should_log = True
+        if args.logging_strategy == IntervalStrategy.STEPS and state.global_step % args.logging_steps == 0:
+            control.should_log = True
+
+        # Evaluate
+        if args.evaluation_strategy == IntervalStrategy.STEPS and state.global_step % args.eval_steps == 0:
+            control.should_evaluate = True
+            if args.load_best_model_at_end:
+                control.should_save = True
+
+        # End training
+        if state.global_step >= state.max_steps:
+            control.should_training_stop = True
+
+        return control
+
+    def on_epoch_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        # Log
+        if args.logging_strategy == IntervalStrategy.EPOCH:
+            control.should_log = True
+
+        # Evaluate
+        if args.evaluation_strategy == IntervalStrategy.EPOCH:
+            control.should_evaluate = True
+
+        return control
+
+    def on_evaluate(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        metric_to_check = args.metric_for_best_model
+        if not metric_to_check.startswith("eval_"):
+            metric_to_check = f"eval_{metric_to_check}"
+        metric_value = kwargs.get('metrics').get(metric_to_check)
+
+        # 计算train指标
+        training_metric = sum(state.training_step_metric_history) / len(state.training_step_metric_history)
+        state.training_step_metric_history = []
+
+        # 输出训练日志，自带日志不太友好
+        training_loss = state.log_history[-2]["loss"]
+        learning_rate = state.log_history[-2]["learning_rate"]
+        eval_loss = state.log_history[-1]["eval_loss"]
+        eval_metric = state.log_history[-1][metric_to_check]
+
+        logger.info(f'train_loss: {training_loss:.5f}, train_metric: {training_metric:.5f}, '
+                    f'global_step: {state.global_step}, epoch: {state.epoch}, learning_rate: {learning_rate}')
+        logger.info(f'valid_loss: {eval_loss:.5f}, valid_metric: {eval_metric:.5f}, '
+                    f'global_step: {state.global_step}, epoch: {state.epoch}')
+
+        # 检查早停
+        operator = np.greater if args.greater_is_better else np.less
+        if state.best_metric is None or (operator(metric_value, state.best_metric) and (
+                abs(metric_value - state.best_metric) > self.early_stopping_threshold)):
+            state.best_metric = metric_value
+            self.early_stopping_patience_counter = 0
+
+            # 保存模型
+            kwargs.get('model').save_pretrained(args.output_dir)
+            kwargs.get('tokenizer').save_pretrained(args.output_dir)
+            state.log_history = None  # 清空log
+            state.save_to_json(os.path.join(args.output_dir, "trainer_state.json"))  # Save the Trainer state
+
+        else:
+            self.early_stopping_patience_counter += 1
+
+        if self.early_stopping_patience_counter >= self.early_stopping_patience:
+            control.should_training_stop = True
+
+
+class BertModelTrainer(Trainer):
+    def __init__(self, **kwargs):
+        super(BertModelTrainer, self).__init__(**kwargs)
+
+    def collate_batch(self, batch):
+        """
+        处理数据，注意batch为list
+        :param batch:
+        :return: dict
+        """
+        sentence_batch = [sentence for sentence, _ in batch]
+        label_batch = [label for _, label in batch]
+        labels = torch.tensor(label_batch, dtype=torch.int64)
+        outputs = self.tokenizer(sentence_batch, truncation=True, padding=True, max_length=32, return_tensors="pt")
+
+        return {"input_ids": outputs["input_ids"], "attention_mask": outputs["attention_mask"], "labels": labels}
+
+    def get_train_dataloader(self) -> DataLoader:
+        """
+        Returns the training :class:`~torch.utils.data.DataLoader`.
+        """
+        if self.train_dataset is None:
+            raise ValueError("Trainer: training requires a train_dataset.")
+
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.args.train_batch_size,
+            collate_fn=self.collate_batch,
+            shuffle=True,
+            drop_last=True,
+            num_workers=self.args.dataloader_num_workers,
+        )
+
+    def get_eval_dataloader(self, eval_dataset=None) -> DataLoader:
+        """
+        Returns the evaluation :class:`~torch.utils.data.DataLoader`.
+        """
+        if eval_dataset is None and self.eval_dataset is None:
+            raise ValueError("Trainer: evaluation requires an eval_dataset.")
+
+        return DataLoader(
+            self.eval_dataset,
+            batch_size=self.args.eval_batch_size,
+            collate_fn=self.collate_batch,
+            shuffle=False,
+            drop_last=False,
+            num_workers=self.args.dataloader_num_workers,
+        )
+
+    @staticmethod
+    def custom_loss(y_pred, label):
+        y_true = F.one_hot(label, y_pred.shape[-1])
+
+        y_pred = (1 - 2 * y_true) * y_pred  # -1 -> pos classes, 1 -> neg classes
+        y_pred_neg = y_pred - y_true * 1e12  # mask the pred outputs of pos classes
+        y_pred_pos = (y_pred - (1 - y_true) * 1e12)  # mask the pred outputs of neg classes
+        zeros = torch.zeros_like(y_pred[..., :1])
+        y_pred = torch.cat([zeros, y_pred_neg, y_pred_pos], dim=-1)
+        loss = torch.logsumexp(y_pred, dim=-1)
+
+        return loss.mean()
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        input_ids, attention_mask, labels = inputs['input_ids'], inputs['attention_mask'], inputs['labels']
+
+        y_pred = self.model(input_ids=input_ids, attention_mask=attention_mask)
+        loss = self.custom_loss(y_pred, labels)
+
+        self.state.training_step_metric_history.append(0.1)
+
+        return loss
+
+    def create_optimizer(self, bert_lr=2e-5, linear_lr=5e-5, weight_decay=0.01):
+        """
+        Setup the optimizer.
+        """
+        no_decay = ["bias", "LayerNorm.weight"]
+        optimizer_grouped_parameters = [
+            {'params': [p for n, p in self.model.named_parameters() if
+                        (n.startswith('bert') and not any(nd in n for nd in no_decay))],
+             'weight_decay': weight_decay, 'lr': bert_lr},
+            {'params': [p for n, p in self.model.named_parameters() if
+                        (n.startswith('bert') and any(nd in n for nd in no_decay))],
+             'weight_decay': 0.0, 'lr': bert_lr},
+
+            {'params': [p for n, p in self.model.named_parameters() if
+                        (n.startswith('classifier') and not any(nd in n for nd in no_decay))],
+             'weight_decay': weight_decay, 'lr': linear_lr},
+            {'params': [p for n, p in self.model.named_parameters() if
+                        (n.startswith('classifier') and any(nd in n for nd in no_decay))],
+             'weight_decay': 0.0, 'lr': linear_lr}
+        ]
+
+        self.optimizer = AdamW(optimizer_grouped_parameters)
+
+        return self.optimizer
+
+    def create_scheduler(self, num_training_steps: int, optimizer: torch.optim.Optimizer = None):
+        """
+        Setup the scheduler
+        """
+        self.lr_scheduler = get_linear_schedule_with_warmup(
+            optimizer=self.optimizer if optimizer is None else optimizer,
+            num_warmup_steps=self.args.get_warmup_steps(num_training_steps),
+            num_training_steps=num_training_steps)
+
+        return self.lr_scheduler
+
+    @torch.no_grad()
+    def prediction_step(self, model, inputs, prediction_loss_only=None, ignore_keys=None):
+        inputs = self._prepare_inputs(inputs)
+        input_ids, attention_mask, labels = inputs['input_ids'], inputs['attention_mask'], inputs['labels']
+
+        logits = self.model(input_ids=input_ids, attention_mask=attention_mask)
+        loss = self.custom_loss(logits, labels)
+
+        if prediction_loss_only:
+            return (loss, None, None)
+
+        return (loss, logits, labels)
+
+
+if __name__ == '__main__':
+    set_seed(42)  # 结果可复现
+
+    data = pd.read_csv('./data/emotion.csv')[:1000]
+    skf = StratifiedKFold(n_splits=5, random_state=42, shuffle=True)
+    for n, (train_idx, test_idx) in enumerate(skf.split(data, data['label'])):
+        train_data, valid_data = data.iloc[train_idx], data.iloc[test_idx]
+        train_dataset = CustomDataset(data_frame=train_data)
+        valid_dataset = CustomDataset(data_frame=valid_data)
+
+        model = CustomModel.from_pretrained("aila_bert_base")
+        tokenizer = BertTokenizer.from_pretrained("aila_bert_base")
+
+        training_args = TrainingArguments(output_dir='output_model_test',
+                                          warmup_ratio=0.1,
+                                          num_train_epochs=100,
+                                          per_device_train_batch_size=16,
+                                          per_device_eval_batch_size=16,
+                                          evaluation_strategy=IntervalStrategy.STEPS,
+                                          save_strategy=IntervalStrategy.STEPS,
+                                          logging_strategy=IntervalStrategy.STEPS,
+                                          save_steps=2,
+                                          eval_steps=2,
+                                          save_total_limit=10,
+                                          logging_steps=2,
+                                          greater_is_better=True,
+                                          metric_for_best_model='accuracy',
+                                          prediction_loss_only=False,
+                                          report_to=["none"],
+                                          disable_tqdm=True,
+                                          no_cuda=False)
+
+
+        def compute_metrics(inputs):
+            """
+            自定义compute_metrics
+            :param inputs: numpy形式？
+            :return:
+            """
+            preds, labels = inputs
+            preds = np.argmax(preds, axis=-1)
+
+            return {'accuracy': (preds == labels).mean()}
+
+
+        early_stopping_callback = CustomEarlyStoppingCallback(early_stopping_patience=4, early_stopping_threshold=0.0)
+        trainer = BertModelTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=valid_dataset,
+            tokenizer=tokenizer,
+            compute_metrics=compute_metrics,
+            callbacks=[early_stopping_callback])
+        trainer.remove_callback(DefaultFlowCallback)  # 去除原有callback, 改变保存策略
+
+        train_result = trainer.train()
